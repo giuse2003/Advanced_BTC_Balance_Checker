@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.DS_Store
+*.tmp
+*.bak
+.vscode/
+
+# Local state, logs and sensitive results
+checkpoint.json
+checkpoint.json.tmp
+risultati.json
+app.log
