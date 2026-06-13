@@ -35,11 +35,38 @@ Durante la scansione ad alta velocità viene verificato solo il saldo attivo (`b
 
 ---
 
-## Requisiti di Sistema
+## Requisiti di Sistema ed Infrastruttura
 
 - Python 3.10 o versioni successive.
-- Un nodo Bitcoin Core in esecuzione locale (`txindex=1` abilitato).
+- Un nodo Bitcoin Core in esecuzione locale (non potato, con `txindex=1`).
 - Fulcrum in esecuzione ed allineato su `127.0.0.1:50001`.
+
+### 1. Configurazione di Bitcoin Core (`bitcoin.conf`)
+Il file `bitcoin.conf` (situato nella directory dei dati di Bitcoin Core, es. `D:\Block`) deve essere configurato con i seguenti parametri abilitati:
+```ini
+server=1
+rpcallowip=127.0.0.1
+rpcport=8332
+txindex=1
+prune=0
+dbcache=12288
+```
+
+### 2. Configurazione di Fulcrum (`fulcrum.conf`)
+L'indicizzatore locale deve interfacciarsi con Bitcoin Core via RPC ed esporre il server sulla porta `50001`. Esempio di configurazione:
+```ini
+datadir = E:/FulcrumDB
+bitcoind = 127.0.0.1:8332
+rpccookie = D:/Block/.cookie
+
+tcp = 127.0.0.1:50001
+admin = 127.0.0.1:8000
+stats = 127.0.0.1:8080
+
+peering = false
+announce = false
+db_mem = 12288
+```
 
 ### Installazione delle Dipendenze Python
 Esegui nel terminale:
