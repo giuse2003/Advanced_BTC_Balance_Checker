@@ -224,7 +224,7 @@ def write_checkpoint(checkpoint):
     safe_write_json(CHECKPOINT_FILE, checkpoint)
 
 # --- Results Management ---
-def save_positive_match(private_key_int, wif, addresses, fulcrum_data):
+def save_positive_match(private_key_int, wif, addresses, fulcrum_data, has_active_balance):
     results = []
     if os.path.exists(RESULTS_FILE):
         try:
@@ -238,11 +238,15 @@ def save_positive_match(private_key_int, wif, addresses, fulcrum_data):
         "wif": wif,
         "addresses": addresses,
         "results": fulcrum_data,
+        "has_active_balance": has_active_balance,
         "found_at": datetime.datetime.now().isoformat()
     }
     results.append(match_entry)
     safe_write_json(RESULTS_FILE, results)
-    logging.info(f"!!! TROVATO SALDO ATTIVO !!! Salvato in {RESULTS_FILE}")
+    if has_active_balance:
+        logging.info(f"!!! TROVATO SALDO ATTIVO !!! Salvato in {RESULTS_FILE}")
+    else:
+        logging.info(f"!!! TROVATA CHIAVE CON STORICO PASSATO (SALDO ZERO) !!! Salvato in {RESULTS_FILE}")
 
 def load_checkpoint():
     if not os.path.exists(CHECKPOINT_FILE):
@@ -322,15 +326,22 @@ def main():
             derived = derive_addresses_and_scripts(current_key)
             batch_keys.append((current_key, derived))
             
-            # Aggiunge le richieste al batch JSON-RPC (solo get_balance per massima velocità)
+            # Aggiunge le richieste al batch JSON-RPC (saldo + storico per rilevare saldi storici)
             for addr_index, addr_type in enumerate(["legacy", "nested", "native"]):
                 sh = derived["scripthashes"][addr_type]
+                # Richiesta Saldo
                 batch_requests.append({
                     "jsonrpc": "2.0",
                     "method": "blockchain.scripthash.get_balance",
                     "params": [sh],
-                    # ID mappa: offset della chiave * 3 + indice indirizzo
-                    "id": offset * 3 + addr_index
+                    "id": offset * 6 + addr_index * 2
+                })
+                # Richiesta Storico
+                batch_requests.append({
+                    "jsonrpc": "2.0",
+                    "method": "blockchain.scripthash.get_history",
+                    "params": [sh],
+                    "id": offset * 6 + addr_index * 2 + 1
                 })
                 
         # 2. Interroga Fulcrum locale via TCP (con riconnessione automatica e riprove)
@@ -357,54 +368,80 @@ def main():
         fund_key_info = None
         
         for offset, (current_key, derived) in enumerate(batch_keys):
-            legacy_bal = batch_responses[offset * 3]["result"]
-            nested_bal = batch_responses[offset * 3 + 1]["result"]
-            native_bal = batch_responses[offset * 3 + 2]["result"]
+            def get_result(resp, default):
+                if isinstance(resp, dict):
+                    if "error" in resp:
+                        logging.error(f"Errore Fulcrum nel batch: {resp['error']}")
+                        return default
+                    return resp.get("result") or default
+                return default
+
+            legacy_bal = get_result(batch_responses[offset * 6], {})
+            legacy_hist = get_result(batch_responses[offset * 6 + 1], [])
+            nested_bal = get_result(batch_responses[offset * 6 + 2], {})
+            nested_hist = get_result(batch_responses[offset * 6 + 3], [])
+            native_bal = get_result(batch_responses[offset * 6 + 4], {})
+            native_hist = get_result(batch_responses[offset * 6 + 5], [])
             
-            # Calcola saldo totale confermato + unconfermed
+            # Calcola saldo totale confermato + unconfirmed
             total_legacy = legacy_bal.get("confirmed", 0) + legacy_bal.get("unconfirmed", 0)
             total_nested = nested_bal.get("confirmed", 0) + nested_bal.get("unconfirmed", 0)
             total_native = native_bal.get("confirmed", 0) + native_bal.get("unconfirmed", 0)
             
             total_sats = total_legacy + total_nested + total_native
             
-            if total_sats > 0:
-                found_funds = True
-                fund_key_info = {
-                    "number": current_key,
-                    "wif": derived["wif"],
-                    "addresses": derived["addresses"],
-                    "scripthashes": derived["scripthashes"],
-                    "balances": {
-                        "legacy": legacy_bal,
-                        "nested": nested_bal,
-                        "native": native_bal
+            # Conta storico transazioni
+            legacy_hist_count = len(legacy_hist) if isinstance(legacy_hist, list) else 0
+            nested_hist_count = len(nested_hist) if isinstance(nested_hist, list) else 0
+            native_hist_count = len(native_hist) if isinstance(native_hist, list) else 0
+            total_hist_count = legacy_hist_count + nested_hist_count + native_hist_count
+            
+            has_active_balance = total_sats > 0
+            has_past_history = total_hist_count > 0
+            
+            if has_active_balance or has_past_history:
+                fulcrum_save_data = {
+                    "legacy": {
+                        "confirmed": legacy_bal.get("confirmed", 0),
+                        "unconfirmed": legacy_bal.get("unconfirmed", 0),
+                        "history_count": legacy_hist_count
+                    },
+                    "nested": {
+                        "confirmed": nested_bal.get("confirmed", 0),
+                        "unconfirmed": nested_bal.get("unconfirmed", 0),
+                        "history_count": nested_hist_count
+                    },
+                    "native": {
+                        "confirmed": native_bal.get("confirmed", 0),
+                        "unconfirmed": native_bal.get("unconfirmed", 0),
+                        "history_count": native_hist_count
                     }
                 }
-                break # Interrompe l'analisi del batch alla prima chiave con fondi
                 
+                if has_active_balance:
+                    found_funds = True
+                    fund_key_info = {
+                        "number": current_key,
+                        "wif": derived["wif"],
+                        "addresses": derived["addresses"],
+                        "total_sats": total_sats,
+                        "offset": offset,
+                        "fulcrum_save_data": fulcrum_save_data
+                    }
+                    break # Interrompe l'analisi del batch per fermare lo script
+                else:
+                    # Trovato solo storico passato -> Salva nel file json senza fermare il ciclo
+                    save_positive_match(current_key, derived["wif"], derived["addresses"], fulcrum_save_data, has_active_balance=False)
+                    
         # 5. Gestione nel caso in cui venga trovato un saldo attivo
         if found_funds:
-            # Query dello storico per la chiave vincente (richiesta di rete aggiuntiva una tantum)
-            history_counts = client.query_history(fund_key_info["scripthashes"])
-            
-            # Combina i dati per il salvataggio
-            fulcrum_save_data = {}
-            for addr_type in ["legacy", "nested", "native"]:
-                bal = fund_key_info["balances"][addr_type]
-                fulcrum_save_data[addr_type] = {
-                    "confirmed": bal.get("confirmed", 0),
-                    "unconfirmed": bal.get("unconfirmed", 0),
-                    "history_count": history_counts[addr_type]
-                }
-                
-            save_positive_match(fund_key_info["number"], fund_key_info["wif"], fund_key_info["addresses"], fulcrum_save_data)
+            save_positive_match(fund_key_info["number"], fund_key_info["wif"], fund_key_info["addresses"], fund_key_info["fulcrum_save_data"], has_active_balance=True)
             
             # Salva il checkpoint aggiornando la posizione alla chiave trovata
             checkpoint_update = {
                 "last_completed_private_key_number": str(fund_key_info["number"]),
                 "next_private_key_number": str(fund_key_info["number"] + 1),
-                "checked_keys": str(checked_keys + offset + 1),
+                "checked_keys": str(checked_keys + fund_key_info["offset"] + 1),
                 "updated_at": datetime.datetime.now().isoformat()
             }
             write_checkpoint(checkpoint_update)
@@ -412,7 +449,7 @@ def main():
             
             logging.info("======================================================================")
             logging.info(f"!!! RILEVATO SALDO ATTIVO SULLA CHIAVE #{fund_key_info['number']} !!!")
-            logging.info(f"Saldo: {sum(b.get('confirmed', 0) + b.get('unconfirmed', 0) for b in fund_key_info['balances'].values())} sat")
+            logging.info(f"Saldo: {fund_key_info['total_sats']} sat")
             logging.info("Lo script è stato INTERROTTO per attendere il tuo intervento.")
             logging.info("Puoi ispezionare il file risultati.json per tutti i dettagli.")
             logging.info("======================================================================")
